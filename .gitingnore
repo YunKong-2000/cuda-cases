@@ -1,0 +1,42 @@
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 编译输出
+# C++
+*.o
+*.ko
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.app
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+
+# 日志和缓存
+*.log
+.cache/
+.tmp/
+temp/
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
