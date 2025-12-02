@@ -5,10 +5,16 @@
 
 // Print usage information
 void printUsage(const char* programName) {
-  std::cout << "Usage: " << programName << " <n>" << std::endl;
+  std::cout << "Usage: " << programName << " <n> <threadnum> <kernel_name> [loop_unroll_times]" << std::endl;
   std::cout << "  n: Number of elements to copy (must be a positive integer)" << std::endl;
+  std::cout << "  threadnum: Number of threads per block (must be a positive integer)" << std::endl;
+  std::cout << "  kernel_name: Kernel to use (baseline, loop_unroll, or vectorize)" << std::endl;
+  std::cout << "  loop_unroll_times: Required when kernel_name is 'loop_unroll' (must be a positive integer)" << std::endl;
   std::cout << std::endl;
-  std::cout << "Example: " << programName << " 1000000" << std::endl;
+  std::cout << "Examples:" << std::endl;
+  std::cout << "  " << programName << " 1000000 1024 baseline" << std::endl;
+  std::cout << "  " << programName << " 1000000 1024 loop_unroll 4" << std::endl;
+  std::cout << "  " << programName << " 1000000 1024 vectorize" << std::endl;
 }
 
 // Check CUDA error and exit if failed
@@ -27,17 +33,54 @@ __global__ void copy_baseline(float* src, float* dst, int n) {
   }
 }
 
+//loop unroll copy kernel
+__global__ void copy_loop_unroll(float* src, float* dst, int n) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  int stride = blockDim.x * gridDim.x;
+  for (int i = idx; i < n; i+=stride) {
+    dst[i] = src[i];
+  }
+}
+
+//vectorize copy kernel
+__global__ void copy_vectorize(float* src, float* dst, int n) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  int float4_count = n / 4;
+  
+  // Copy aligned float4 elements
+  if (idx < float4_count) {
+    reinterpret_cast<float4*>(dst)[idx] = reinterpret_cast<float4*>(src)[idx];
+  }
+  
+  // Handle remaining elements (when n is not a multiple of 4)
+  // Use threads from the last block to handle remaining elements
+  // int remaining = n % 4;
+  // if (remaining > 0 && blockIdx.x == gridDim.x - 1) {
+  //   int remaining_start = float4_count * 4;
+  //   int remaining_idx = remaining_start + threadIdx.x;
+    
+  //   // Only threads in the last block and within remaining count handle remaining elements
+  //   if (threadIdx.x < remaining && remaining_idx < n) {
+  //     dst[remaining_idx] = src[remaining_idx];
+  //   }
+  // }
+}
+
 int main(int argc, char** argv) {
-  // Check argument count
-  if (argc != 2) {
+  // Check minimum argument count
+  if (argc < 4) {
     std::cerr << "Error: Invalid number of arguments." << std::endl;
     std::cerr << std::endl;
     printUsage(argv[0]);
     return 1;
   }
 
-  // Parse and validate input parameter
+  // Parse and validate input parameters
   int n = 0;
+  int threadnum = 0;
+  std::string kernel_name;
+  int loop_unroll_times = 0;
+  
   try {
     n = std::stoi(argv[1]);
   } catch (const std::exception& e) {
@@ -47,9 +90,60 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  try {
+    threadnum = std::stoi(argv[2]);
+  } catch (const std::exception& e) {
+    std::cerr << "Error: Invalid input parameter. '" << argv[2] << "' is not a valid integer." << std::endl;
+    std::cerr << std::endl;
+    printUsage(argv[0]);
+    return 1;
+  }
+
+  kernel_name = std::string(argv[3]);
+
+  // Validate kernel name
+  if (kernel_name != "baseline" && kernel_name != "loop_unroll" && kernel_name != "vectorize") {
+    std::cerr << "Error: Invalid kernel name. Must be 'baseline' or 'loop_unroll' or 'vectorize' (got '" << kernel_name << "')." << std::endl;
+    std::cerr << std::endl;
+    printUsage(argv[0]);
+    return 1;
+  }
+
+  // Parse loop_unroll_times if using loop_unroll kernel
+  if (kernel_name == "loop_unroll") {
+    if (argc < 5) {
+      std::cerr << "Error: loop_unroll_times parameter is required when using 'loop_unroll' kernel." << std::endl;
+      std::cerr << std::endl;
+      printUsage(argv[0]);
+      return 1;
+    }
+    try {
+      loop_unroll_times = std::stoi(argv[4]);
+    } catch (const std::exception& e) {
+      std::cerr << "Error: Invalid input parameter. '" << argv[4] << "' is not a valid integer." << std::endl;
+      std::cerr << std::endl;
+      printUsage(argv[0]);
+      return 1;
+    }
+    if (loop_unroll_times <= 0) {
+      std::cerr << "Error: loop_unroll_times must be a positive integer (got " << loop_unroll_times << ")." << std::endl;
+      std::cerr << std::endl;
+      printUsage(argv[0]);
+      return 1;
+    }
+  }
+
   // Validate that n is positive
   if (n <= 0) {
     std::cerr << "Error: Number of elements must be a positive integer (got " << n << ")." << std::endl;
+    std::cerr << std::endl;
+    printUsage(argv[0]);
+    return 1;
+  }
+
+  // Validate that threadnum is positive
+  if (threadnum <= 0) {
+    std::cerr << "Error: Number of threads per block must be a positive integer (got " << threadnum << ")." << std::endl;
     std::cerr << std::endl;
     printUsage(argv[0]);
     return 1;
@@ -74,13 +168,23 @@ int main(int argc, char** argv) {
   checkCudaError(cudaMalloc((void**)&device_dst, n * sizeof(float)), "cudaMalloc (device_dst)");
   checkCudaError(cudaMemcpy(device_src, host_src, n * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy (HostToDevice)");
 
-  dim3 block_size(1024);
+  dim3 block_size(threadnum);
   dim3 grid_size((n + block_size.x - 1) / block_size.x);
   
+  // Launch kernel based on selection
   {
     RECORD_START();
-    // Launch kernel
-    copy_baseline<<<grid_size, block_size>>>(device_src, device_dst, n);
+    if (kernel_name == "baseline") {
+      copy_baseline<<<grid_size, block_size>>>(device_src, device_dst, n);
+    } else if (kernel_name == "loop_unroll") {
+      dim3 loop_unroll_grid_size(grid_size.x / loop_unroll_times);
+      copy_loop_unroll<<<loop_unroll_grid_size, block_size>>>(device_src, device_dst, n);
+    } else if (kernel_name == "vectorize") {
+      // Calculate grid size for float4 operations: need (n+3)/4 float4 elements
+      int float4_count = (n + 3) / 4;
+      dim3 vectorize_grid_size((float4_count + block_size.x - 1) / block_size.x);
+      copy_vectorize<<<vectorize_grid_size, block_size>>>(device_src, device_dst, n);
+    }
     RECORD_STOP();
   }
   

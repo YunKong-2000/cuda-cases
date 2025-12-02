@@ -9,10 +9,19 @@ if [ ! -f $src_file ]; then
     exit 1
 fi
 
-# Compile if executable doesn't exist
-if [ ! -f $exe_file ]; then
+# Compile if executable doesn't exist or source is newer
+if [ ! -f $exe_file ] || [ $src_file -nt $exe_file ]; then
     echo "Compiling $src_file..."
-    nvcc -o $exe_file $src_file
+    # Detect compute capability if available, otherwise use sm_80 as default
+    COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+    if [ -z "$COMPUTE_CAP" ]; then
+        COMPUTE_CAP="80"
+        echo "Warning: Could not detect compute capability, using default sm_80"
+    else
+        echo "Detected compute capability: $COMPUTE_CAP"
+    fi
+    # Compile with explicit architecture flag to avoid PTX toolchain mismatch
+    nvcc -arch=sm_${COMPUTE_CAP} -o $exe_file $src_file
     if [ $? -ne 0 ]; then
         echo "Error: Compilation failed"
         exit 1
@@ -56,15 +65,46 @@ echo "Running copy kernel with different sizes"
 echo "=========================================="
 echo ""
 
-for ((n=10; n<=30; n+=2)); do
-    num_elements=$((2**$n))
+# Kernel selection: "baseline", "loop_unroll", "vectorize", or "compare" (runs all three)
+KERNEL_NAME="${KERNEL_NAME:-baseline}"
+
+# Function to run a single kernel test
+run_kernel_test() {
+    local kernel_name=$1
+    local block_dim=$2
+    local num_elements=$3
+    local n=$4
+    local loop_unroll_times=${5:-0}
     
     echo "----------------------------------------"
     echo "Testing with 2^$n = $num_elements elements"
     echo "----------------------------------------"
     
+    echo "----------------------------------------"
+    echo "Testing with block_dim = $block_dim threads per block"
+    if [ "$kernel_name" = "loop_unroll" ]; then
+        echo "Testing with loop_unroll_times = $loop_unroll_times"
+    fi
+    echo "Kernel: $kernel_name"
+    echo "----------------------------------------"
+    
+    # Set kernel-specific variables
+    local NCU_KERNEL_NAME=""
+    local CMD_ARGS=""
+    
+    if [ "$kernel_name" = "baseline" ]; then
+        NCU_KERNEL_NAME="copy_baseline"
+        CMD_ARGS="$num_elements $block_dim baseline"
+    elif [ "$kernel_name" = "vectorize" ]; then
+        NCU_KERNEL_NAME="copy_vectorize"
+        CMD_ARGS="$num_elements $block_dim vectorize"
+    elif [ "$kernel_name" = "loop_unroll" ]; then
+        NCU_KERNEL_NAME="copy_loop_unroll"
+        CMD_ARGS="$num_elements $block_dim loop_unroll $loop_unroll_times"
+    fi
+    
     # Run the program normally
-    ./$exe_file $num_elements
+    ./$exe_file $CMD_ARGS
     
     # Run with ncu to collect DRAM metrics
     if [ "$NCU_AVAILABLE" = true ]; then
@@ -72,7 +112,6 @@ for ((n=10; n<=30; n+=2)); do
         echo "Collecting DRAM metrics with ncu..."
         
         # Determine ncu command (with or without sudo)
-        # Only use sudo if explicitly requested AND sudo is available
         if [ "$USE_SUDO_NCU" = true ] && [ "$SUDO_AVAILABLE" = true ]; then
             NCU_CMD="sudo ncu"
         else
@@ -80,29 +119,27 @@ for ((n=10; n<=30; n+=2)); do
         fi
         
         # Run ncu and capture output
-        # Note: --print-summary requires an argument (per-kernel, per-gpu, etc.)
         ncu_output=$($NCU_CMD \
-            --kernel-name copy_baseline \
+            --kernel-name $NCU_KERNEL_NAME \
             --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum \
             --print-summary per-kernel \
             --target-processes all \
-            ./$exe_file $num_elements 2>&1)
+            ./$exe_file $CMD_ARGS 2>&1)
         
         ncu_exit_code=$?
         
-        # Check for command not found error (e.g., sudo not available)
+        # Check for command not found error
         if [ $ncu_exit_code -eq 127 ]; then
             if echo "$ncu_output" | grep -q "sudo: command not found"; then
                 echo ""
                 echo "Warning: sudo command not found (likely in container environment)"
                 echo "Trying ncu without sudo..."
-                # Retry without sudo
                 ncu_output=$(ncu \
-                    --kernel-name copy_baseline \
+                    --kernel-name $NCU_KERNEL_NAME \
                     --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum \
                     --print-summary per-kernel \
                     --target-processes all \
-                    ./$exe_file $num_elements 2>&1)
+                    ./$exe_file $CMD_ARGS 2>&1)
                 ncu_exit_code=$?
             fi
         fi
@@ -124,7 +161,7 @@ for ((n=10; n<=30; n+=2)); do
                 echo "Or configure system permissions (see https://developer.nvidia.com/ERR_NVGPUCTRPERM)"
             fi
             echo ""
-            continue
+            return
         fi
         
         if [ $ncu_exit_code -eq 0 ]; then
@@ -141,14 +178,91 @@ for ((n=10; n<=30; n+=2)); do
             if ! echo "$ncu_output" | grep -q "ERR_NVGPUCTRPERM"; then
                 echo "Common issues:"
                 echo "  1. Library version mismatch (GLIBC/GLIBCXX) - try running in the same environment where compiled"
-                echo "  2. Kernel name mismatch - verify kernel name is 'copy_baseline'"
+                echo "  2. Kernel name mismatch - verify kernel name is '$NCU_KERNEL_NAME'"
                 echo "  3. GPU not available"
             fi
         fi
     fi
     
     echo ""
-done
+}
+
+# Check if comparing all kernels
+if [ "$KERNEL_NAME" = "compare" ] || [ "$KERNEL_NAME" = "all" ]; then
+    echo "Comparing all three kernels: baseline, loop_unroll (times=4), vectorize"
+    echo "Fixed parameters: block_dim=256, loop_unroll_times=4"
+    echo ""
+    
+    block_dim=256
+    loop_unroll_times=4
+    
+    # Test all data sizes
+    for ((n=10; n<=30; n+=2)); do
+        num_elements=$((2**$n))
+        
+        echo "========================================"
+        echo "Testing with 2^$n = $num_elements elements"
+        echo "========================================"
+        echo ""
+        
+        # Run baseline
+        echo ">>> Running baseline kernel..."
+        run_kernel_test "baseline" $block_dim $num_elements $n
+        
+        # Run loop_unroll
+        echo ">>> Running loop_unroll kernel (times=$loop_unroll_times)..."
+        run_kernel_test "loop_unroll" $block_dim $num_elements $n $loop_unroll_times
+        
+        # Run vectorize
+        echo ">>> Running vectorize kernel..."
+        run_kernel_test "vectorize" $block_dim $num_elements $n
+        
+        echo "========================================"
+        echo ""
+    done
+    
+elif [ "$KERNEL_NAME" = "baseline" ] || [ "$KERNEL_NAME" = "vectorize" ]; then
+    echo "Using kernel: $KERNEL_NAME"
+    echo ""
+    # Baseline and Vectorize: test different block_dim and data sizes
+    if [ "$KERNEL_NAME" = "baseline" ]; then
+        NCU_KERNEL_NAME="copy_baseline"
+        KERNEL_ARG="baseline"
+    else
+        NCU_KERNEL_NAME="copy_vectorize"
+        KERNEL_ARG="vectorize"
+    fi
+    
+    block_dim_list=(256)
+    # block_dim_list=(128 256 512 1024)
+    
+    for block_dim in "${block_dim_list[@]}"; do
+    for ((n=10; n<=30; n+=2)); do
+        num_elements=$((2**$n))
+        run_kernel_test "$KERNEL_NAME" $block_dim $num_elements $n
+    done
+    done
+    
+elif [ "$KERNEL_NAME" = "loop_unroll" ]; then
+    echo "Using kernel: $KERNEL_NAME"
+    echo ""
+    # Loop unroll: fixed block_dim=256, test different LOOP_UNROLL_TIMES and data sizes
+    block_dim=256
+    # Loop unroll times to test (can be customized)
+    loop_unroll_times_list=(1 2 4 8)
+    # loop_unroll_times_list=(1 2 4 8 16 32)
+    
+    for loop_unroll_times in "${loop_unroll_times_list[@]}"; do
+    for ((n=10; n<=30; n+=2)); do
+        num_elements=$((2**$n))
+        run_kernel_test "loop_unroll" $block_dim $num_elements $n $loop_unroll_times
+    done
+    done
+    
+else
+    echo "Error: Invalid KERNEL_NAME. Must be 'baseline', 'loop_unroll', 'vectorize', or 'compare'"
+    exit 1
+fi
 
 echo "=========================================="
 echo "Testing completed"
