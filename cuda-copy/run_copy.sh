@@ -21,7 +21,8 @@ if [ ! -f $exe_file ] || [ $src_file -nt $exe_file ]; then
         echo "Detected compute capability: $COMPUTE_CAP"
     fi
     # Compile with explicit architecture flag to avoid PTX toolchain mismatch
-    nvcc -arch=sm_${COMPUTE_CAP} -o $exe_file $src_file
+    # Explicitly link CUDA runtime library to ensure proper linking
+    nvcc -arch=sm_${COMPUTE_CAP} -lcudart -o $exe_file $src_file
     if [ $? -ne 0 ]; then
         echo "Error: Compilation failed"
         exit 1
